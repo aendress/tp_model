@@ -1,0 +1,1624 @@
+---
+title: 'When forgetting fosters learning: A saliency map for TP computations'
+author: |
+  | Ansgar D. Endress, City, University of London
+  | Scott P. Johnson, UCLA
+bibliography:
+- /Users/endress/ansgar.bib
+#- /Users/endress/ansgar.own.bib
+output:
+  pdf_document:
+    citation_package: natbib
+    keep_tex: yes
+    number_sections: yes
+    toc: no
+  html_notebook:
+    number_sections: yes
+    theme: spacelab
+    toc: yes
+    toc_float: yes
+  html_document:
+    df_print: paged
+    number_sections: yes
+    theme: spacelab
+    toc: yes
+    toc_float: yes
+  word_document:
+    toc: no
+keywords: Keywords
+csl: /Users/endress/csl_files/current-biology.csl
+abstract: In many domains, organisms need to split continuous signals into sequences of recurring units. For example, during language acquisition, humans need to split fluent speech into its underlying words. One prominent candidate mechanism involves computation of co-occurrence statistics such Transitional Probabilities (TPs). TPs indicate how predictive items are of each other. For example, items such as syllables are more predictive of each other when they are part of the same unit (i.e., word) than when they come from different units. TP computations are surprisingly flexible and sophisticated. Humans are sensitive to (1) forward and backward TPs, (2) TPs between adjacent items and longer-distance TPs and (3) recognize TPs in both known and novel units. Here, we show that a simple and biologically plausible model explains these data. We present a network where excitatory interactions are tuned by Hebbian learning and where inhibitory interactions control the overall level of activation. We show that (1) if forgetting is weak, activations are so long-lasting that indiscriminate associations occur among *all* items; (2) if forgetting is strong, activations are so short-lived that they do not persist after the offset of stimuli, and no associations are formed; and (3) for intermediate forgetting rates, this simple network accounts for all of the hallmarks mentioned above. Ironically, forgetting seems to be a key ingredient that enables these sophisticated learning abilities.
+---
+
+```{r setup, echo = FALSE, include=FALSE}
+rm (list=ls())
+
+#load("~/Experiments/TP_model/tp_model.RData")
+
+#options (digits = 3)
+knitr::opts_chunk$set(
+    # Run the chunk
+    eval = TRUE,
+    # Don't include source code
+    echo = FALSE, 
+    # Print warnings to console rather than the output file
+    warning = FALSE,  
+    # Stop on errors
+    error = FALSE,
+    # Print message to console rather than the output file
+    message = FALSE,
+    # Include chunk output into output
+    include = TRUE,
+    # Don't reformat R code
+    tidy = FALSE,
+    # Center images
+    # Breaks showing figures side by side, so switch this to default
+    fig.align = 'center', 
+    # Show figures where they are produced
+    fig.keep = 'asis',
+    # Prefix for references like \ref{fig:chunk_name}
+    fig.lp = 'fig',
+    # For double figures, and doesn't hurt for single figures 
+    fig.show = 'hold', 
+    # Default image width
+    out.width = '100%')
+
+# other knits options are here:
+# https://yihui.name/knitr/options/
+
+```
+
+```{r load-libraries, echo = FALSE, include = FALSE, message = FALSE, warning = FALSE}
+
+# Read in a random collection of custom functions
+if (Sys.info()[["user"]] %in% c("ansgar", "endress")){
+    source ("/Users/endress/R.ansgar/ansgarlib/R/tt.R")
+    source ("/Users/endress/R.ansgar/ansgarlib/R/null.R")
+    #source ("helper_functions.R")
+} else {
+    # Note that these will probably not be the latest versions
+    source("http://endress.org/progs/tt.R")
+    source("http://endress.org/progs/null.R")
+}
+
+library ("knitr")
+library(latex2exp)
+library (cowplot)
+library (ggpubr)
+```
+
+```{r set-default-parameters-network, echo = FALSE, include = FALSE, message = FALSE, warning = FALSE}
+
+# Number of neurons
+N_NEURONS <- 19
+
+ACT_FNC <- 'rational_logistic'
+
+# Forgetting for activation
+L_ACT_DEFAULT <- 0.5
+L_ACT_SAMPLES <- seq (0, 1, .2)
+#L_ACT <- L_ACT_DEFAULT
+L_ACT <- L_ACT_SAMPLES
+
+# Forgetting for weights
+L_W <- 0
+
+# Activation coefficient
+A <- .7
+
+# Inhibition coefficient 
+B <- .4
+
+# Learning coefficient
+R <- 0.05
+
+# noise for activation
+NOISE_SD_ACT <- 0.001
+
+# noise for weights
+NOISE_SD_W <- 0
+```
+
+```{r set-default-parameters-simulations, echo = FALSE, include = FALSE, message = FALSE, warning = FALSE}
+
+# Number of items (e.g., words)
+N_WORDS <- 4
+
+# Number of units per item (e.g., syllables)
+N_SYLL_PER_WORD <- 3
+
+# Number of repetitions per word
+N_REP_PER_WORD <- 100
+
+# Number of simulations/subjects
+N_SIM <- 100
+
+# Adjust number of neurons if required
+if (N_NEURONS < ((N_WORDS * N_SYLL_PER_WORD) + 1))
+    N_NEURONS <- (N_WORDS * N_SYLL_PER_WORD) + 1
+
+PRINT.INDIVIDUAL.PDFS <- TRUE
+current.plot.name <- "xxx"
+
+# Set seed to Cesar's birthday
+set.seed (1207100)
+```
+
+```{r list-parameters, echo = FALSE, results='hide'}
+list_parameters(accepted_classes = c("numeric")) %>%
+    knitr::kable(
+        "latex", 
+        booktabs = T, 
+        caption='\\label{tab:params}Parameters used in the simulations') %>%
+    kableExtra::kable_styling()
+```
+
+```{r define-functions, echo = FALSE, include = FALSE, message = FALSE, warning = FALSE}
+
+act_fnc <- function (act, fnc = ACT_FNC, ...){
+    
+    switch (fnc,
+            "rational_logistic" = act / (1 + act),
+            "relu" = pmax (0, act),
+            "tanh" = tanh (act),
+            stop ("Unknown activation function"))
+}
+
+make_act_vector <- function (ind, n_neurons){
+    
+    act <- rep (0, n_neurons)
+    act[ind] <- 1
+    
+    return (act)
+    
+}
+
+update_activation <- function (act, w, ext_input, l_act = 1, a = 1, b = 0, noise_sd = 0, ...){
+    # activation, weights, external_input, decay, activation coefficient, inhibition coefficient
+    
+    act_output <- act_fnc (act, ...)
+    
+    act_new <- act
+    
+    # Decay     
+    if (l_act>0)
+        act_new <- act_new - l_act * act 
+    
+    # External input
+    act_new <- act_new + ext_input
+    
+    # Excitation
+    act_new <- act_new + (a * w %*% act_output)
+    
+    # Inhibition (excluding self-inhibition)
+    act_new <- act_new - (b * (sum (act_output) - act_output))
+    
+    # Noise
+    if (noise_sd > 0)    
+        act_new <- act_new + rnorm (length(act_new), 0, noise_sd)
+    
+    act_new <- as.vector(act_new)
+    
+    act_new[act_new < 0] <- 0
+    
+    return (act_new)
+}
+
+update_weights <- function (w, act, r = 1, l = 0, noise_sd, ...){
+    
+    act_output <- act_fnc (act, ...)
+    
+    # learning 
+    w_new <- w  + r * outer(act_output, act_output)
+    
+    # decay
+    if (l > 0)
+        w_new <- w_new - l * w 
+    
+    if (noise_sd > 0)
+        w_new <- w_new + as.matrix (rnorm (length(w_new),
+                                           0,
+                                           noise_sd),
+                                    ncol = ncol (w_new))
+    
+    # No self-excitation
+    diag (w_new) <- 0
+    
+    w_new[w_new < 0] <- 0
+    
+    return (w_new)
+}
+
+familiarize <- function (stream_matrix,
+                         l_act = 1,
+                         a = 1,
+                         b = 0, 
+                         noise_sd_act = 0,
+                         r = 1,
+                         l_w = 0,
+                         noise_sd_w = 0,
+                         n_neurons = max (stream),
+                         return.act.and.weights = FALSE,
+                         ...){
+    
+    # Initialization
+    act <- abs(rnorm (n_neurons, 0, noise_sd_act))
+    w <- matrix (abs(rnorm (n_neurons^2, 0, noise_sd_w)), 
+                 ncol = n_neurons)
+    diag(w) <- 0
+    
+    if (return.act.and.weights)
+        act.weight.list <- list ()
+    
+    # Randomize familiarization 
+    stream_matrix <- stream_matrix[sample(nrow(stream_matrix)),]
+    stream <- c(t(stream_matrix))
+    
+    act_sum <- c()
+    for (item in stream){
+        
+        current_input <- make_act_vector(item, n_neurons)
+        
+        act <- update_activation(act, w, current_input, 
+                                 l_act, a, b, noise_sd_act,
+                                 ...)
+        
+        if (r > 0)
+            w <- update_weights (w, act, r, l_w, noise_sd_w)
+        
+        act_sum <- c(act_sum, sum(act))
+        
+        if (return.act.and.weights){
+            act.weight.list[[1 + length(act.weight.list)]] <- 
+                list (item = item,
+                      act = act,
+                      w = w)
+            
+        }
+    }
+    
+    if (return.act.and.weights)
+        return (list (
+            w = w,
+            act_sum = act_sum,
+            act.weight.list = act.weight.list))
+    else
+        return (list (
+            w = w,
+            act_sum = act_sum))
+}
+
+test_list <- function (test_item_list,
+                       w,
+                       l_act = 1, a = 1, b = 0, 
+                       noise_sd_act = 0,
+                       n_neurons,
+                       return.global.act = FALSE,
+                       ...) {
+    # Arguments
+    #   test_item_list  List of test-items (i.e., numeric vectors)
+    #   w               Current weight matrix
+    #   l_act           Forgetting rate for activation. Default:  1
+    #   a               Excitatory coefficient. Default: 1
+    #   b               Inhibitory coefficient. Default: 0
+    #   noise_sd_act    Standard deviation of the activation noise. Default: 0
+    #   n_neurons       Number of neurons in the network.
+    #   return.global.act 
+    #                   Sum total activation in each test-item (TRUE) or just 
+    #                   the activation in the test-item (FALSE)
+    #                   Default: FALSE
+    
+    test_act_sum <- data.frame (item = character(),
+                                act = numeric ())
+    
+    for (ti in test_item_list){
+        
+        act <- abs(rnorm (n_neurons, 0, noise_sd_act))
+        
+        act_sum <- c()
+        
+        for (item in ti){
+            
+            current_input <- make_act_vector(item, n_neurons)
+            act <- update_activation(act, res$w, current_input, 
+                                     l_act, a, b, noise_sd_act,
+                                     ...)
+            
+            if (return.global.act)
+                act_sum <- c(act_sum, sum(act))
+            else 
+                act_sum <- c(act_sum, sum(act[ti]))
+        }
+        
+        test_act_sum <- rbind (test_act_sum,
+                               data.frame (item = paste (ti, collapse="-"),
+                                           act = sum (act_sum)))
+    }   
+    
+    test_act_sum <- test_act_sum %>%
+        column_to_rownames ("item") %>% 
+        t
+    
+    return (test_act_sum)
+}
+
+make_diff_score <- function (dat = ., 
+                             col.name1,
+                             col.name2,
+                             normalize.scores = TRUE,
+                             luce.rule = FALSE){
+    
+    if (luce.rule){
+            d.score <- dat[,col.name1]
+            normalize.scores <- TRUE
+    } else {
+        d.score <- dat[,col.name1] - dat[,col.name2]
+    }
+    
+    if (any (d.score != 0) &&
+        (normalize.scores))
+        d.score = d.score / (dat[,col.name1] + dat[,col.name2])
+    
+    return (d.score)
+    
+}
+
+summarize_condition <- function (dat,
+                                 selected_cols,
+                                 selected_cols_labels){ 
+    
+    sapply (selected_cols,
+            function (X){
+                c(M = mean (dat[,X]),
+                  SE = mean (dat[,X]) / 
+                      sqrt (length (dat[,X]) -1),
+                  p.wilcox = wilcox.test (dat[,X])$p.value,
+                  p.simulations = mean (dat[,X] > 0))
+            },
+            USE.NAMES = TRUE) %>% 
+        #signif (3) %>%
+        as.data.frame() %>%
+        setNames (gsub ("\n", " ",
+                        selected_cols_labels[selected_cols])) %>%
+        # format_engr removes them otherwise
+        rownames_to_column ("Statistic")
+        #docxtools::format_engr(sigdig=3) 
+    
+}
+
+format_p_simulations <- function (prop_sim){ 
+    
+    p_sim <- 100 * prop_sim
+    
+    min_diff_from_chance <- 
+        get.min.number.of.correct.trials.by.binom.test(N_SIM)
+    min_diff_from_chance <- 100 * min_diff_from_chance / N_SIM
+    min_diff_from_chance <- min_diff_from_chance - 50
+    
+    p_sim <- ifelse (abs (p_sim-50) >= min_diff_from_chance,
+                    paste ("({\\bf ", p_sim, " \\%})", 
+                           sep =""), 
+                    paste ("(", p_sim, " \\%)", 
+                           sep ="") )
+    
+    return (p_sim)
+}
+
+get_sign_pattern_from_results <- function (l_act, dat){
+
+    sign_pattern <- lapply (l_act, 
+        function (CURRENT_L){
+            tmp_p_values <- dat %>%
+                filter (l_act == CURRENT_L) %>%
+                dplyr::select (-c("l_act")) %>%
+                column_to_rownames("Statistic")
+            
+            # Convert the proportion of simulations with a given outcome 
+            # to a string; note that the proportion always gives the proportion 
+            # for the majority pattern
+            tmp_p_simulations <- tmp_p_values["p.simulations",] %>%
+                mutate_all(format_p_simulations)
+            
+            # Extract the significance pattern into 
+            # * + (significant preference for target)
+            # * - (significant preference for foil)
+            # * 0 (no significant preference)
+            tmp_sign_pattern <- (tmp_p_values["p.wilcox",] <= .05) * 1
+            tmp_sign_pattern <- tmp_sign_pattern * 
+                sign(tmp_p_values["M",])
+            
+            tmp_sign_pattern <- tmp_sign_pattern %>%
+                mutate_all(function (X) 
+                    ifelse (X > 0, 
+                            "+", 
+                            ifelse (X < 0, 
+                                    "-", 
+                                    "0") ) )
+            
+            tmp_sign_pattern <- 
+                tmp_sign_pattern %>%
+                as.data.frame() %>%
+                paste (., tmp_p_simulations, sep = " ") %>% 
+                t () %>%
+                as.data.frame() %>%
+                setNames (names (tmp_sign_pattern)) %>% 
+                add_column(l_act = CURRENT_L, .before = 1) %>%
+                rownames_to_column("rowname") %>%
+                dplyr::select (-c("rowname"))
+            
+            return (tmp_sign_pattern)
+        }
+    )
+    
+    sign_pattern <- do.call ("rbind", sign_pattern)
+    
+    sign_pattern
+}
+
+get_sign_pattern_for_plot %<a-% {
+    # From https://github.com/kassambara/ggpubr/issues/79
+    
+    . %>%
+        melt (id.vars = "l_act",
+              variable.name= "ItemType",
+              value.name = "d") %>%
+        group_by (l_act, ItemType) %>%
+        rstatix::wilcox_test(d ~ 1, mu = 0) %>%
+        mutate (p.star = ifelse (p > .05, "",
+                                 ifelse (p > .01,
+                                         "*",
+                                         ifelse (p > .001,
+                                                 "**",
+                                                 "***")))) %>%
+        mutate(y.position = 0)
+}
+ 
+add_signif_to_plot <- function (gp, 
+                                dat.df,
+                                selected_cols){
+ 
+    panel.info <- ggplot_build(gp)$layout$panel_params
+
+    y.max <- lapply (panel.info, 
+               function (X) max (X$y.range)) %>% 
+        unlist %>%
+        rep (., each = length (selected_cols))
+
+    df.signif <- dat.df[,c("l_act",
+                         selected_cols)] %>%
+        get_sign_pattern_for_plot %>%
+        mutate (y.position = y.max)
+    
+    gp <- gp + 
+        ggpubr::stat_pvalue_manual(df.signif, 
+                               label="p.star", 
+                               xmin="l_act", 
+                               xmax = "ItemType", 
+                               remove.bracket = TRUE)
+
+    return (gp)
+}
+
+
+format_theme %<a-% 
+{
+    theme_light() +
+        theme(#text = element_text(size=20), 
+            plot.title = element_text(size = 18, hjust = .5),
+            axis.title = element_text(size=16),
+            axis.text.x = element_text(size=14, angle = 45),
+            axis.text.y = element_text(size=14),
+            legend.title = element_text(size=16),
+            legend.text = element_text(size=14))
+}
+
+remove_x_axis  %<a-% 
+{
+    
+    theme(axis.title.x=element_blank(),
+          axis.text.x=element_blank(),
+          axis.ticks.x=element_blank())
+}
+
+rename_stuff_in_tables %<a-% {
+    . %>%
+        setNames (gsub ("l_act", "$\\\\lambda_a$", names (.))) %>%
+        mutate (Statistic = compose (
+            function (X) {gsub ("^M$", "*M*", X)},
+            function (X) {gsub ("^SE$", "*SE*", X)},
+            function (X) {gsub ("^p.wilcox$", "$p_{Wilcoxon}$", X)},
+            function (X) {gsub ("^p.simulations$", "$P_{Simulations}$", X)}
+        ) (Statistic)) 
+}
+
+find_chain_parts <- function() {
+    # From https://stackoverflow.com/questions/42560389/get-name-of-dataframe-passed-through-pipe-in-r
+    i <- 1
+    while(!("chain_parts" %in% ls(envir=parent.frame(i))) && i < sys.nframe()) {
+          i <- i+1
+      }
+    parent.frame(i)
+}
+
+print.plot <- function (p, 
+                        p.name = NULL,
+                        print.pdf = PRINT.INDIVIDUAL.PDFS){
+    
+    if (is.null (p.name)){
+    # From https://stackoverflow.com/questions/42560389/get-name-of-dataframe-passed-through-pipe-in-r
+    
+     ee <- find_chain_parts()
+     p.name <- deparse(ee$lhs)
+    }
+    
+    if (print.pdf){
+        
+        pdf.name = sprintf ("figures/%s.pdf",
+                            gsub ("\\.", "\\_",
+                                  p.name))
+        pdf (pdf.name)
+        print (p)
+        invisible(dev.off ())
+    }
+    
+    print (p)
+}
+
+italisize_for_tex <- function (x = .){
+    gsub("\\*(.+?)\\*", 
+         "{\\\\em \\1}", 
+         x, perl = TRUE)
+}
+
+```
+
+```{r define-caption-functions}
+
+# Here we define functions to print the figure captions for consistency across figures
+
+get.comparisons.for.caption <- function (experiment_type){
+    
+    if (experiment_type == "basic") {
+        
+        return ("Unit vs. Part-Unit: {\\em ABC} vs. {\\em BC:D} and {\\em ABC} vs. {\\em C:DE}; Rule-Unit vs. Class-Unit: {\\em AGC} vs. {\\em AGF} and {\\em AXC} vs. {\\em AXF}")
+        
+    } else if (experiment_type == "phantoms") {
+        
+        return ("Unit vs. Part-Unit: {\\em ABC} vs. {\\em BC:D} and {\\em ABC} vs. {\\em C:DE}; Phantom-Unit vs. Part-Unit: Phantom-Unit vs. {\\em BC:D} and Phantom-Unit vs. {\\em C:DE}; Unit vs. Phantom-Unit")
+        
+    } else {
+        stop ("Unknown experiment type.")
+    }
+}
+
+write.caption.diff.scores <- function (experiment_type, label, order, activation_type) {
+    
+    comparisons <- get.comparisons.for.caption(experiment_type)
+    
+    caption.text <- sprintf('\\label{fig:%s}Difference scores for items presented in {\\bf %s order}, different forgetting rates (0, 0.2, 0.4, 0.6, 0.8 and 1), and for the different comparisons (%s). The scores are calculated based the %s as a measure of the network\'s familiarity with the items. Significance is assessed based on Wilcoxon tests against the chance level of zero.',
+                            label, order, comparisons, activation_type)
+    
+    return (caption.text)
+}
+
+write.caption.p.sim <- function (experiment_type, label, order, activation_type) {
+    
+    comparisons <- get.comparisons.for.caption(experiment_type)
+    
+    caption.text <- sprintf('\\label{fig:%s}Percentage of simulations with a preference for the target items for items presented in {\\bf %s order}, different forgetting rates (0, 0.2, 0.4, 0.6, 0.8 and 1) and for the different comparisons (%s). The simulations are assessed based on the %s. The dashed line shows the minimum percentage of simulations that is significant based on a binomial test.',
+                            label, order, comparisons, activation_type)
+    
+    return (caption.text)
+}
+
+```
+
+
+# Introduction
+Organisms often need to segment continuous signals into discrete recurring units, from recognizing meaningful actions in the continuous movement of other agents [@Newtson1973;@Newtson1977;@Zacks2001;@Zacks2007] to language acquisition, where learners need to find out where words start and where they end in fluent speech [@Aslin1998;@Saffran-Science;@Saffran1996b]. In the context of language acquisition, this challenge is called the segmentation problem [@Aslin1998;@Saffran-Science;@Saffran1996b] and is clearly one of the first challenges infants face, even before they can acquire the meaning of any word.
+
+A prominent set of mechanisms for solving the segmentation problem relies on co-occurrence statistics of various sorts. These mechanisms track the predictability of items such as syllables. For example, predicting the next syllable after "the" is much harder than predicting the next syllable after "whis", because "the" can be followed by any noun while there are few possible continuations after "whis" (e.g., whiskey, whisker, ...). More formally, these predictive relationships have been quantified using Transitional Probabilities (TPs), i.e., the conditional probability of a syllable $\sigma_2$ following another syllable $\sigma_1$ $P(\sigma_2|\sigma_1)$.
+
+After the initial discovery that infants and other animals are sensitive to TPs in general [@Aslin1998;@Chen2015;@Creel2004;@Endress-tone-tps;@Endress-Action-Axc;@Fiser2002a;@Fiser2005;@Glicksohn2011;@Hauser2001;@Saffran1996b;@Saffran-Science;@Saffran1999;@Saffran2001;@Sohail2016;@Toro2005;@Turk-Browne2005;@Turk-Browne-reversal], further research revealed the astonishing sophistication of these abilities. For example, infants prefer high-TP items to low-TP items even when the items are equated for frequency of occurrence [@Aslin1998], and, in a more extreme version of this experiment, adults prefer high-TP items to low-TP items even when they had heard or seen only the low-TP items but not the high-TP items [@Endress-Phantoms;@Endress-Phantoms-Vision;@Perruchet2012]. Adults and infants can track backwards TPs [@Endress-Action-Axc;@Perruchet2008;@Pelucchi2009;@Turk-Browne-reversal] and discriminate high-TP items from low-TP items when the test-items are played in reverse order with respect to the familiarization (i.e., they readily recognize the item *CBA* after familiarization with *ABC* [@Endress-Action-Axc;@Turk-Browne-reversal]).
+
+Learners can even track TPs between non-adjacent items 
+[@Endress-tone-tps;@Endress-Action-Axc;@Pena2002;@Siegelman2015], though in some experiments additional manipulations were required [@Creel2004;@Pacton2008].
+
+How can we make sense of these data? While a variety of computational models have been proposed to explain word segmentation (e.g., [@Batchelder2002;@Brent1996;@Christiansen1998;@Frank2010;@Orban2008;@Perruchet1998;@Swingley2005], none of the extant models captures the sophistication of statistical learning abilities in their entirety.
+
+For example, network models (such as Simple Recurrent Networks [@Elman1990]) are directional, and thus do not account for backward TPs, while their sensitivity to non-adjacent TPs will likely depend on the network parameters. "Chunking models" that store items in memory [@Batchelder2002;@Perruchet1998] and information-theoretic models (or related Bayesian models) that minimize storage space in memory [@Brent1996;@Orban2008] will not track (adjacent or non-adjacent) TPs in unattested items, and thus do not account for the entire range of data either.[^prior_models]
+
+[^prior_models]: While it is certainly possible to extend existing information-theoretic or Bayesian models to account for such data by appropriately changing the cost function, it would shift the focus of such models from ideal-observer models of word segmentation to process models attempting to fit existing data. In this case, however, the psychological implausibility of such ideal-observer models as process models becomes a liability (see e.g., [@Endress-BayesRules;@Endress-Simplicity;@Glymour2007;@Jones2011;@Marcus2013;@Sakamoto2008]).
+
+Here, we suggest that an ability to succeed in the crucial test cases above
+follows naturally from a correlational learning mechanism such as Hebbian learning. Specifically, we assume that each item (syllable, visual shape, ...) is represented by some population of neurons, and that participants are exposed to some sequence *ABCD*..., where each letter stands for an item. If the activation of such a population decays more slowly than the duration of an item, two adjacent items will be active simultaneously, and thus form an association. For example, if the representation of *A* is still active while *B* occurs, these representations will form an association. But if the representation of *A* is still active while *C* occurs, *A* and *C* will form an association as well even though they are not temporarily adjacent (see [@Endress-tone-tps] for a qualitative suggestion that such a model might account for the learning of non-adjacent TPs). It should be noted that these associations are not directional: just as presenting *A* will activate *B*, presenting *B* will activate *A*.
+
+Here, we provide a computational implementation of this model. The model is a fairly generic network, based on a widely used model of saliency maps in the parietal cortex [@Bays2010;@Endress-Catastrophic-Interference;@Gottlieb2007;@Roggeman2010;@Sengupta2014] to which we added a Hebbian learning component.[^role_of_attention] 
+
+[^role_of_attention]: We use this network architecture as it is fairly generic and widely used, but have no particular claims about attentional involvement in TP computations (but see [@Toro2005a;@Turk-Browne2005]).
+
+Specifically, the network consists of units that stand for populations of neurons encoding the items. Excitatory connections between units are developed according to a Hebbian learning rule. To keep the total activation in the network at a reasonable level, we also added mutual interference among the units that does not undergo learning. 
+
+Further specifics of the model can be found in Supplementary Information XXX.
+
+# Computational principles
+```{r illustration-run, echo = FALSE, include = FALSE, warning = FALSE, message = FALSE}
+fam_illustration <- matrix (rep(1:9, 100), 
+                            byrow = TRUE, ncol=3)
+
+res_illustration <- familiarize (stream = fam_illustration,
+                                 l_act = .5, a = A, b = B, noise_sd_act = 0,
+                                 r = R, l_w = 0, noise_sd_w = 0,
+                                 n_neurons = 9,
+                                 return.act.and.weights = TRUE)
+
+#plot (res$act_sum, type="l")
+
+# Extract a data frame of activations
+act_illustration <- lapply (res_illustration$act.weight.list,
+                            function (X) X$act) %>%
+    data.frame () %>%
+    setNames (NULL) %>%
+    t %>% 
+    data.frame ()
+
+# Ocurrences of the first element
+first_element <- res_illustration$act.weight.list[[1]]$item
+occ_first_element <- lapply (res_illustration$act.weight.list, 
+                             function (X) X$item == first_element) %>% 
+    unlist %>% 
+    which
+
+first_word_first_occ_plot <- 
+    act_illustration[min(occ_first_element) + 0:2,
+                     first_element + 0:2] %>%
+    setNames (LETTERS[1:3]) %>%
+    add_column(Step = 1:3, .before = 1) %>%
+    melt (id = "Step",
+          variable.name="Unit",
+          value.name = "Activation") %>%
+    ggplot (aes (x = Step, y = Activation, 
+                 colour = Unit,
+                 linetype = Unit)) + 
+    format_theme + 
+    labs (title = "First Occurrence") +
+    ylim (c(0,1)) + 
+    scale_x_continuous(name = "Current Item",
+                       breaks = 1:3, 
+                       labels=LETTERS[1:3]) + 
+    geom_line ()
+
+
+first_word_last_occ_plot <- 
+    act_illustration[max(occ_first_element) + 0:2,
+                     first_element + 0:2] %>%
+    setNames (LETTERS[1:3]) %>%
+    add_column(Step = 1:3, .before = 1) %>%
+    melt (id = "Step",
+          variable.name="Unit",
+          value.name = "Activation") %>%
+    ggplot (aes (x = Step, y = Activation, 
+                 colour = Unit,
+                 linetype = Unit)) + 
+    format_theme + 
+    ylim (c(0,1)) + 
+    labs (title = "Last Occurrence") +
+    scale_x_continuous(name = "Current Item",
+                       breaks = 1:3, 
+                       labels=LETTERS[1:3]) + 
+    geom_line ()
+
+
+weight_plot <- 
+    res_illustration$act.weight.list[[max(occ_first_element)+2]]$w[first_element + 0:2,
+                                                                   first_element + 0:2] %>%
+    data.frame ()%>%
+    setNames (LETTERS[1:3]) %>%
+    add_column(Item1 = LETTERS[1:3], .before = 1) %>%
+    melt (variable.name = "Item2",
+          value.name = "Weight") %>%
+    ggplot(aes(Item1, Item2, fill = Weight))+
+    format_theme + 
+    labs (title = "Final Weights") +
+    geom_tile()+
+    scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+                         #midpoint = 0,
+                         space = "Lab", name="Weight") 
+#+ coord_fixed()
+```
+
+We first illustrate the computational principles of the model by running a simulation a stream consisting of 9 symbols *A*, *B*, ...*I* that are arranged into three three-item units *ABC*, *DEF* and *GHI*. Units were concatenated in random order so that each unit occurred 100 times. 
+
+Figure \ref{fig:comp_illustration} shows the activation in response to the presentation of each item when the unit *ABC* is presented for the first time (a) and for the last time (b) as well as the weights between the underlying items after the last presentation.
+
+Figure \ref{fig:comp_illustration}a shows that the *A* unit is still active when the *C* item is presented. As a result, we would expect a strong and reciprocal associative link between *A* and *B* and a weaker one between *A* and *C*, which is just what Figure \ref{fig:comp_illustration}c shows.
+
+Comparing Figures \ref{fig:comp_illustration}a and b reveals that the activation of *A* is more reduced at its last occurrence. This is due to the inhibitory input from other units: On the first occurrence, no other units are active yet, and activation of *A* can only be reduced through inhibition when other units are active. In contrast, the activations of *B* and *C* do not seem reduced between Figures \ref{fig:comp_illustration} a and c. This is because they receive excitatory input from *A* (and *B* in the case of *C*) which compensates the inhibitory input from other units.
+
+```{r illustration-plot, echo = FALSE, fig.align = 'default', fig.cap = '\\label{fig:comp_illustration}Illustration of the computational principles of the simulations. We plot the network activation when stimulated by a recurring unit {\\em ABC}. (a) On the first occurrence of the unit, no associations have been formed yet. Hence, when $A$ is presented, $A$ (but no other items) becomes active, and then decays, though some activation persists even while $C$ is presented. Likewise, $B$ and $C$ become active upon presentation, and then decay. The initial activation is weaker for $B$ and $C$ than for $A$ due to the presence of inhibitory interactions; this is because, for $A$, no other potentially inhibiting representations are active yet, while other activated items (e.g., $A$) have inhibitory input for $B$ and $C$. (b) On the last occurrence, associations between the items have been formed. When encountering external stimulation, the activation of $B$ and $C$ is thus great than that of $A$, because $B$ and $C$ (but not $A$) receive excitatory input from the strongly associated, preceeding items . (c) Weights at the end of the familiarization phase. The connection weights between adjacent items are stronger than those between non-adjacent items (i.e., between $A$ and $C$).'}
+
+    cowplot::plot_grid(first_word_first_occ_plot, 
+                   first_word_last_occ_plot, 
+                   weight_plot,
+                   nrow=3,
+                   labels = "auto") %>%
+    print.plot (p.name = "illustration")
+
+```
+
+We will now use these computational principles to illustrate some of the critical results in the statistical learning literature. 
+
+# Experiments with a basic stream: Words and part-words, tested forwards and backwards
+Our basic experiment consists of a sequence of `r N_WORDS` units of `r N_SYLL_PER_WORD` items each (e.g., `r N_WORDS` words of `r N_SYLL_PER_WORD` syllables). These units are randomly concatenated into a familiarization stream so that each unit occurs `r N_REP_PER_WORD` times. We will then present the network with test-items (see below) and record the total network activation while each item is presented. We hypothesize that the total activation provides us with a measure of the network's familiarity with the unit.[^activation_in_items] 
+
+[^activation_in_items]: We also report simulations where we consider only the network activation in the items that are part of the current test-item rather than the global network activation. For example, when an unit *ABC* is presented, we assess the network's familiarity with the items by recording the activation in *A*, *B* and *C* -- rather than the activation in *all* items. Intuitively, one would expect the results to be similar, as the active items will mainly be those that have been stimulated. This simulations are reported in Supplementary Information XXX. 
+
+This cycle of familiarization and test will be repeated `r N_SIM` times, representing `r N_SIM` participants.
+
+While we keep the parameters for self-excitation and mutual inhibition constant ($\alpha$ and $\beta$ in Supplementary Material XXX), we used forgetting rates ($\lambda_{act}$ in Supplementary Material XXX) between `r toString (L_ACT)`. As forgetting in our model is exponential, a forgetting rate of zero means no forgetting, a forgetting rate of 1 implies the complete disappearance of activation on the next time step (unless a population of neurons receives excitatory input from other populations), and a forgetting rate of .5 implies the decay of half of the activation. 
+
+```{r basic-experiment-run, echo = FALSE}
+fam_basic <- matrix (rep(1:(N_WORDS * N_SYLL_PER_WORD), 
+                         N_REP_PER_WORD), 
+                     byrow = TRUE, ncol=N_SYLL_PER_WORD)
+
+test_items_basic <- list (1:3,        # W
+                          2:4,        # PW (BCA) 
+                          3:5,        # PW (CAB)
+                          c(1,4,3),   # RW (moved middle syllable)
+                          c(1,4,9),   # CW (moved middle syllable)
+                          c(1,19,3),  # RW (new middle syllable)
+                          c(1,19,9)   # CW (new middle syllable)
+)
+test_items_basic <- c(test_items_basic, 
+                      lapply (test_items_basic, 
+                              rev))
+
+# We test-items in two ways: by recording the activation in the test-items themselves
+# and by recording the activation in the entire network (_global)
+
+test_act_sum_basic_list <- list ()
+test_act_sum_basic_global_list <- list ()
+
+for (current_l in L_ACT){
+    # Sample through forgetting values 
+    
+    current_test_act_sum_basic <- data.frame()
+    current_test_act_sum_basic_global <- data.frame()
+    
+    for (i in 1:N_SIM){
+        
+        res <- familiarize (stream = fam_basic,
+                            l_act = current_l, a = A, b = B, noise_sd_act = NOISE_SD_ACT,
+                            r = R, l_w = L_W, noise_sd_w = NOISE_SD_W,
+                            n_neurons = 19)
+        
+        #plot (res$act_sum, type="l")
+        
+        # Record activation in test-items
+        current_test_act_sum_basic <- rbind (current_test_act_sum_basic,
+                                             test_list (test_item_list = test_items_basic,
+                                                        w = res$w,
+                                                        l_act = current_l, a = A, b = B, 
+                                                        noise_sd_act = NOISE_SD_ACT,
+                                                        n_neurons = 19,
+                                                        return.global.act = FALSE)) 
+        
+        # Record global activation in network
+        current_test_act_sum_basic_global <- rbind (current_test_act_sum_basic_global,
+                                             test_list (test_item_list = test_items_basic,
+                                                        w = res$w,
+                                                        l_act = current_l, a = A, b = B, 
+                                                        noise_sd_act = NOISE_SD_ACT,
+                                                        n_neurons = 19,
+                                                        return.global.act = TRUE)) 
+        
+    }
+    
+    # End of forgetting sampling loop
+    
+    test_act_sum_basic_list[[1 + length (test_act_sum_basic_list)]]  <- 
+        current_test_act_sum_basic
+    
+    test_act_sum_basic_global_list[[1 + length (test_act_sum_basic_global_list)]]  <- 
+        current_test_act_sum_basic_global
+}
+
+# Combine results from different forgetting rates
+test_act_sum_basic <- 
+    do.call (rbind, 
+             test_act_sum_basic_list)
+
+test_act_sum_basic <- test_act_sum_basic %>% 
+    add_column(l_act = rep (L_ACT,
+                            sapply (test_act_sum_basic_list,
+                                    nrow)),
+               .before = 1
+    )
+
+test_act_sum_basic_global <- 
+    do.call (rbind, 
+             test_act_sum_basic_global_list)
+
+test_act_sum_basic_global <- test_act_sum_basic_global %>% 
+    add_column(l_act = rep (L_ACT,
+                            sapply (test_act_sum_basic_global_list,
+                                    nrow)),
+               .before = 1
+    )
+
+```
+
+```{r basic-experiment-global-create_diff}
+
+diff_basic_global <- cbind(
+    l_act = data.frame (l_act = test_act_sum_basic_global$l_act),
+    
+    # Adjacent FW TP: Words vs. Part-Words (Forward)
+    w_pw1_fw = make_diff_score(test_act_sum_basic_global,
+                               "1-2-3", "2-3-4",
+                               TRUE),
+    w_pw2_fw = make_diff_score(test_act_sum_basic_global,
+                               "1-2-3", "3-4-5",
+                               TRUE),
+    
+    # Adjacent BW TP: Words vs. Part-Words (Backward)
+    w_pw1_bw = make_diff_score(test_act_sum_basic_global,
+                               "3-2-1", "4-3-2",
+                               TRUE),
+    w_pw2_bw = make_diff_score(test_act_sum_basic_global,
+                               "3-2-1", "5-4-3",
+                               TRUE),
+    
+    # Non-adjacent FW TP: Rule-Words vs. Class-Words (Forward)
+    rw_cw_fw1 = make_diff_score(test_act_sum_basic_global,
+                                "1-4-3", "1-4-9",
+                                TRUE),
+    rw_cw_fw2 = make_diff_score(test_act_sum_basic_global,
+                                "1-19-3", "1-19-9",
+                                TRUE),
+    
+    # Non-adjacent BW TP: Rule-Words vs. Class-Words (Backward)
+    rw_cw_bw1 = make_diff_score(test_act_sum_basic_global,
+                                "3-4-1", "9-4-1",
+                                TRUE),
+    rw_cw_bw2 = make_diff_score(test_act_sum_basic_global,
+                                "3-19-1", "9-19-1",
+                                TRUE)
+) %>%
+    as.data.frame()
+
+
+#boxplot (diff_basic, ylim=c(0, .2))
+```
+
+## Adjacent and non-adjacent forward TPs
+In this section, we seek to demonstrate that the network is sensitive to basic forward TPs among adjacent and non-adjacent items.
+
+Our experiments are inspired by the paradigm by [@Saffran-Science] and [@Saffran1996b], among many others. After familiarization as described above, the network will be tested on units such as *ABC* and "part-units." Part-units are  created either by taking the last two items from one unit and the first item from the next unit (e.g., *BC:D*, where the colon indicates the former unit boundary but is not present in the stimuli) or by taking the last item from one unit and the first two items from the next unit (e.g., *C:DE*). As a result, part-units have occurred during the speech stream but straddled a unit boundary and thus have weaker TPs. We thus expect the network to be more familiar with units than with part-units. 
+
+The demonstration of a sensitivity to TPs among *non*-adjacent items is inspired by the paradigm by [@Endress-AXC]. Specifically, our high non-adjacent TP test-items take their first and the last item from the same unit, but the middle item from a different unit (e.g., *AGC*, where *A* and *C* come from the unit *ABC*, while *G* was the first item of the unit *GHI*). In analogy to [@Endress-AXC], we call these items *rule-units*. 
+
+Our low non-adjacent TP test-items take their first and the last items from the different unit and take the middle item from yet another unit (e.g., *AGF*, where *A* is the first item from *ABC*, *F* is the last item from *DEF*, while *G* was the first item of the unit *GHI*). In analogy to [@Endress-AXC], we call these items *class-units*. The critical difference between the rule-units and the class-units is that the TP between the first and the last item is 1.0 in rule-units and 0 in class-units.
+
+We will also test a second rule-unit vs. class-unit contrast where the middle item is novel and did not appear in the familiarization stream (e.g., *AXC* vs. *AXF*, where *X* has never appeared in the familiarization stream).
+
+For each comparison, we will create normalized difference scores to evaluate the model performance:
+
+$$
+d = \frac{\text{Item}_1 - \text{Item}_2}{\text{Item}_1 + \text{Item}_2}
+$$
+
+We then evaluate these difference scores against the chance level of zero using Wilcoxon tests. An alternative evaluation metric is to count the number of simulations (each representing a participants) preferring the target items, and to evaluate this count using a binomial test. With `r N_SIM` simulations per parameter set, performance is significantly different from the chance level of 50% if at least `r (get.min.number.of.correct.trials.by.binom.test(N_SIM)/N_SIM) * 100 %>% signif (3)` % of the simulations show a preference for the target items.
+
+```{r basic-experiment-global-create-plot_diff-fw}
+selected_cols_fw <- c(
+    "w_pw1_fw", "w_pw2_fw",
+    "rw_cw_fw1", "rw_cw_fw2")
+
+selected_cols_labels <- c(
+    w_pw1_fw = "ABC vs\nBC:D",
+    w_pw2_fw = "ABC vs\nC:DE",
+    rw_cw_fw1 = "AGC vs\nAGF", 
+    rw_cw_fw2 = "AXC vs\nAXF",
+    
+    w_pw1_bw = "ABC vs\nBC:D",
+    w_pw2_bw = "ABC vs\nC:DE",
+    rw_cw_bw1 = "AGC vs\nAGF", 
+    rw_cw_bw2 = "AXC vs\nAXF"
+)
+
+diff_basic_global_fw_plot <- 
+    diff_basic_global[,c("l_act",
+                  selected_cols_fw)] %>%
+    melt (id.vars = "l_act",
+          variable.name= "ItemType",
+          value.name = "d") %>%
+    ggplot(aes(x=ItemType, y=d, fill=ItemType))+
+    format_theme + 
+    remove_x_axis + 
+    labs (title = "Forward TPs",
+          y = TeX("\\frac{Type_1 - Type_2}{Type_1 + Type_2}")) +
+#     scale_x_discrete(name = "Item Type",
+#                      breaks = 1:4,                 
+#                      labels=                         selected_cols_labels[selected_cols_fw]) + 
+    facet_wrap(~l_act, scales = "free_y") +
+    scale_fill_discrete(name = element_blank(), 
+                        labels = selected_cols_labels[selected_cols_fw]) + 
+    theme(legend.position = "bottom",
+          legend.direction = "horizontal") + 
+    geom_boxplot()  
+
+diff_basic_global_fw_plot <- add_signif_to_plot(
+    diff_basic_global_fw_plot,
+    diff_basic_global,
+    selected_cols_fw)
+
+
+```
+
+```{r basic-experiment-global-create-plot_diff-bw}
+selected_cols_bw <- c(
+    "w_pw1_bw", "w_pw2_bw",
+    "rw_cw_bw1", "rw_cw_bw2")
+
+diff_basic_global_bw_plot <- 
+    diff_basic_global[,c("l_act",
+                  selected_cols_bw)] %>%
+    melt (id.vars = "l_act",
+          variable.name= "ItemType",
+          value.name = "d") %>%
+    ggplot(aes(x=ItemType, y= d, fill = ItemType))+
+    format_theme + 
+    remove_x_axis + 
+    labs (title = "Backward TPs",
+          y = TeX("\\frac{Type_1 - Type_2}{Type_1 + Type_2}")) +
+#    scale_x_discrete(name = "Item Type",
+#                     breaks = 1:4, 
+                     #labels=selected_cols_labels[selected_cols_bw]) + 
+    facet_wrap(~l_act, scales = "free_y") + 
+    scale_fill_discrete(name = element_blank(), 
+                        labels = selected_cols_labels[selected_cols_bw]) + 
+    theme(legend.position = "bottom",
+          legend.direction = "horizontal") + 
+    geom_boxplot()
+
+diff_basic_global_bw_plot <- add_signif_to_plot(
+    diff_basic_global_bw_plot,
+    diff_basic_global,
+    selected_cols_bw)
+    
+```
+
+```{r basic-experiment-global-evaluate_diff-fw}
+
+diff_basic_global_fw_p_values <- 
+    lapply (L_ACT,
+            function (CURRENT_L){
+                diff_basic_global %>%
+                    filter (l_act == CURRENT_L) %>% 
+                    summarize_condition(., 
+                                        selected_cols_fw,
+                                        selected_cols_labels) %>% 
+                    add_column(l_act = CURRENT_L, .before = 1)
+            }
+    ) 
+
+diff_basic_global_fw_p_values <- do.call ("rbind", 
+                                   diff_basic_global_fw_p_values )
+
+```
+
+```{r basic-experiment-global-evaluate_diff-bw}
+
+diff_basic_global_bw_p_values <- 
+    lapply (L_ACT,
+            function (CURRENT_L){
+                diff_basic_global %>%
+                    filter (l_act == CURRENT_L) %>% 
+                    summarize_condition(., 
+                                        selected_cols_bw,
+                                        selected_cols_labels) %>% 
+                    add_column(l_act = CURRENT_L, .before = 1)
+            }
+    ) 
+
+diff_basic_global_bw_p_values <- do.call ("rbind", 
+                                   diff_basic_global_bw_p_values )
+
+```
+```{r basic-experiment-global-create-plot_p_sim-fw}
+
+p_sim_basic_global_fw_plot <- diff_basic_global_fw_p_values %>%
+    filter (Statistic == "p.simulations") %>%
+    dplyr::select(-c("Statistic")) %>%
+        melt (id.vars = "l_act",
+          variable.name= "ItemType",
+          value.name = "P")  %>%
+    ggplot(aes(x=ItemType, y= 100 * P, fill = ItemType))+
+    format_theme + 
+    remove_x_axis + 
+    labs (title = "Forward TPs",
+          y = "Percentage of Simulations") +
+#    scale_x_discrete(name = "Item Type",
+#                     breaks = 1:4, 
+                     #labels=selected_cols_labels[selected_cols_bw]) + 
+    facet_wrap(~l_act, scales = "fixed") + 
+    scale_fill_discrete(name = element_blank(), 
+                        labels = unname (selected_cols_labels[selected_cols_fw])) + 
+    theme(legend.position = "bottom",
+          legend.direction = "horizontal") + 
+    geom_bar(stat = "identity") + 
+    geom_abline(intercept = 
+                    get.min.number.of.correct.trials.by.binom.test(N_SIM)/N_SIM * 100, 
+                slope = 0,
+                linetype = "dashed") + 
+    geom_text (aes (label=100*P, y=5))
+
+
+```
+
+```{r basic-experiment-global-create-plot_p_sim-bw}
+
+p_sim_basic_global_bw_plot <- diff_basic_global_bw_p_values %>%
+    filter (Statistic == "p.simulations") %>%
+    dplyr::select(-c("Statistic")) %>%
+        melt (id.vars = "l_act",
+          variable.name= "ItemType",
+          value.name = "P")  %>%
+    ggplot(aes(x=ItemType, y= 100 * P, fill = ItemType))+
+    format_theme + 
+    remove_x_axis + 
+    labs (title = "Backward TPs",
+          y = "Percentage of Simulations") +
+#    scale_x_discrete(name = "Item Type",
+#                     breaks = 1:4, 
+                     #labels=selected_cols_labels[selected_cols_bw]) + 
+    facet_wrap(~l_act, scales = "fixed") + 
+    scale_fill_discrete(name = element_blank(), 
+                        labels = unname (selected_cols_labels[selected_cols_bw])) + 
+    theme(legend.position = "bottom",
+          legend.direction = "horizontal") + 
+    geom_bar(stat = "identity") + 
+    geom_abline(intercept = 
+                    get.min.number.of.correct.trials.by.binom.test(N_SIM)/N_SIM * 100, 
+                slope = 0,
+                linetype = "dashed") + 
+    geom_text (aes (label=100*P, y=5))
+
+
+```
+
+```{r basic-experiment-global-create-plot_diff-fw-plot, echo = FALSE, fig.align = 'default', fig.cap = write.caption.diff.scores ("basic", "basic_global_diff_fw", "forward", "global activation") }
+
+diff_basic_global_fw_plot %>% print.plot
+
+```
+
+```{r basic-experiment-global-create-plot_p_sim-fw-plot, echo = FALSE, fig.align = 'default', fig.cap = write.caption.p.sim("basic", "basic_global_p_sim_fw", "forward", "global activation in the network")}
+
+p_sim_basic_global_fw_plot %>% print.plot
+
+```
+
+```{r basic-experiment-global-create-plot_combined-fw-plot_new_code, fig.height=9, fig.cap = "Results for items presented in *forward order*, different forgetting rates (0, 0.2, 0.4, 0.6, 0.8 and 1), and for the different comparisons (Unit vs. Part-Unit: ABC vs. BC:D and ABC vs. C:DE; Rule-Unit vs. Class-Unit: AGC vs. AGF and AXC vs. AXF). (a) Difference scores. The scores are calculated based the global activation as a measure of the network's familiarity with the items. Significance is assessed based on Wilcoxon tests against the chance level of zero. (b) Percentage of simulations with a preference for the target items. The simulations are assessed based on the global activation in the network. The dashed line shows the minimum percentage of simulations that is significant based on a binomial test."}
+
+# plot_grid_with_title(diff_basic_global_fw_plot +
+#               theme (title = element_blank()),
+#           p_sim_basic_global_fw_plot +
+#               theme (title = element_blank()),
+#           nrow=2,
+#           labels = "auto",
+#           title.label = "Forward TPs") %>%
+#     print.plot (p.name = "basic_global_combined_fw")
+
+
+# cowplot::plot_grid(diff_basic_global_fw_plot + 
+#                        labs (title = element_blank()),
+#                    p_sim_basic_global_fw_plot +
+#                        labs (title = element_blank()), 
+#                    nrow=2,
+#                    labels = "auto") %>%
+#      print.plot (p.name = "basic_global_combined_fw")
+
+
+ggpubr::ggarrange (diff_basic_global_fw_plot + 
+                       labs (title = element_blank()),
+                   p_sim_basic_global_fw_plot +
+                       labs (title = element_blank()), 
+                   nrow=2,
+                   labels = "auto",
+                   common.legend = TRUE,
+                   legend = "bottom") %>%
+    ggpubr::annotate_figure (top = ggpubr::text_grob (str_wrap ("Fig. 3 (forward order) Amended code", 25), 
+                face = "bold", size = 18)) %>% 
+    print.plot (p.name = "basic_global_combined_fw")
+```
+
+```{r basic-experiment-global-evaluate_diff-print, results='hide'}
+diff_basic_global_fw_p_values %>%
+    rbind (., diff_basic_global_bw_p_values) %>%
+    rename_stuff_in_tables %>%
+    mutate(Statistic = italisize_for_tex (Statistic)) %>%    
+    mutate(Statistic = italisize_for_tex (Statistic)) %>%
+    docxtools::format_engr(sigdig=3) %>%
+    knitr::kable(
+        "latex", 
+        longtable = TRUE,
+        booktabs = TRUE, 
+        escape = FALSE,
+        caption = '\\label{tab:basic_diff} Detailed results for the different forgetting rates and comparisons (Unit vs. Part-Unit: *ABC* vs. *BC:D* and *ABC* vs. *C:DE*; Rule-Unit vs. Class-Unit: *AGC* vs. *AGF* and *AXC* vs. *AXF*), for items presented in forward and backward order, and using the global activation as a measure of the network\'s familiarity with the items. $p_{Wilcoxon}$ represents the *p* value of a Wilcoxon test on the difference scores against the chance level of zero. $P_{Simulations}$ represents the proportion of simulations showing positive difference scores.') %>%
+    kableExtra::kable_styling(latex_options = c(#"striped", 
+#                                                "scale_down",
+                                                "repeat_header")) %>%
+    kableExtra::pack_rows("Forward", 
+                          1, 
+                          4 * length (L_ACT)) %>%
+    kableExtra::pack_rows("Backward", 
+                          1 + (4 * length (L_ACT)), 
+                          2 * 4 * length (L_ACT)) 
+```
+
+```{r basic-experiment-global-sign-pattern-print, results='hide'}
+get_sign_pattern_from_results(L_ACT, 
+                              diff_basic_global_fw_p_values) %>%
+    rbind (., get_sign_pattern_from_results(L_ACT, 
+                              diff_basic_global_bw_p_values)) %>% 
+    setNames(., gsub("l_act", "$\\\\lambda_a$", names(.))) %>%
+    knitr::kable(
+        "latex", 
+        longtable = FALSE,
+        booktabs = TRUE, 
+        escape = FALSE,
+        caption = '\\label{tab:basic_global_sign_pattern} Pattern of significance for the different forgetting rates and comparisons (Unit vs. Part-Unit: *ABC* vs. *BC:D* and *ABC* vs. *C:DE*; Rule-Unit vs. Class-Unit: *AGC* vs. *AGF* and *AXC* vs. *AXF*), for items presented in forward and backward order, and using the global activation as a measure of the network\'s familiarity with the items. +, - and 0 represent, respectively, a significant preference for the target item, a significant preference against the target item, or no significant preference, as evaluated by Wilcoxon tests on the relevant difference scores. Numbers indicate the proportion of simulations preferring target-items; bold-face numbers indicate significance in a binomial test.') %>%
+    kableExtra::kable_styling(latex_options = c("striped", 
+                                                "scale_down",
+                                                "repeat_header")) %>%
+    kableExtra::pack_rows("Forward", 
+                          1, 
+                          length (L_ACT)) %>%
+    kableExtra::pack_rows("Backward", 
+                          1 + length (L_ACT), 
+                          2 * length (L_ACT)) 
+
+```
+
+
+The results are shown in Figure \ref{fig:basic_global_diff_fw} and \ref{fig:basic_global_p_sim_fw}. For low forgetting rates (0 and 0.2), the network fails for all comparisons. This is unsurprising as low forgetting rates mean that all items remain active for many time steps, so that the network indiscriminately forms associations among virtually all items, and thus fails to track the statistical structure of the familiarization stream. Likewise, for the maximum forgetting rate, the network fails on all discriminations as well; this is again unsurprising, as no associations can be formed among items if forgetting is so strong that there is no overlap in activation between items. 
+
+Critically, for intermediate forgetting rates, the network performed well above chance for all comparisons. It performed somewhat better when contrasting units with *C:DE* part-units, as has been observed in human participants by [@Fiser2002]. Importantly, however, all difference scores are clearly above chance, and between 83\% and 100\% of the simulations yielded positive difference scores (though only 63% yielded positive difference scores for forgetting rate .6 and non-adjacent TP comparisons). Further, adjacent TPs support higher forgetting rate than non-adjacent TPs, because activations need to last longer for non-adjacent TPs to be formed; while a sensitivity to TPs among adjacent items is maintained for a forgetting rate of 0.8, there is no such sensitivity to non-adjacent TPs.
+
+### Adjacent and non-adjacent backward TPS
+There is considerable evidence that participants are not only sensitive to forward TPs, but also to backward TPs. They track TPs when the only informative TPs are backward rather than forward TPs [@Perruchet2008;Pelucchi2009], and discriminate high-TP items from low-TP items when the test-items are played in reverse order [@Endress-Action-Axc;Turk-Browne-reversal].
+
+Here, we test the network's ability to track backward TPs by familiarizing the network with the same streams as in the previous section, but playing the test-items in reverse order (e.g., *CBA* instead of *ABC*).
+
+```{r basic-experiment-global-create-plot_diff-bw-plot, echo = FALSE, fig.align = 'default', fig.cap = write.caption.diff.scores ("basic", "basic_global_diff_bw", "backward", "global activation")}
+
+diff_basic_global_bw_plot %>% 
+    print.plot 
+
+```
+
+```{r basic-experiment-global-create-plot_p_sim-bw-plot, echo = FALSE, fig.align = 'default', fig.cap = write.caption.p.sim("basic", "basic_global_p_sim_fw", "backward", "global activation in the network")}
+
+p_sim_basic_global_bw_plot %>% 
+    print.plot
+
+```
+
+```{r basic-experiment-global-create-plot_combined-bw-plot_new_code, fig.height = 9, fig.cap = "Results for items presented in backward order, different forgetting rates (0, 0.2, 0.4, 0.6, 0.8 and 1), and for the different comparisons (Unit vs. Part-Unit: ABC vs. BC:D and ABC vs. C:DE; Rule-Unit vs. Class-Unit: AGC vs. AGF and AXC vs. AXF). (a) Difference scores. The scores are calculated based the global activation as a measure of the network’s familiarity with the items. Significance is assessed based on Wilcoxon tests against the chance level of zero. (b) Percentage of sim- ulations with a preference for the target items. The simulations are assessed based on the global activation in the network. The dashed line shows the minimum percentage of simulations that is significant based on a binomial test."}
+
+ # plot_grid_with_title(diff_basic_global_bw_plot +
+ #               theme (title = element_blank()),
+ #           p_sim_basic_global_bw_plot +
+ #               theme (title = element_blank()),
+ #           nrow=2,
+ #           labels = "auto",
+ #           title.label = "Backward TPs") %>%
+ #     print.plot (p.name = "basic_global_combined_bw")
+
+# cowplot::plot_grid(diff_basic_global_bw_plot + 
+#                        labs (title = element_blank()),
+#                    p_sim_basic_global_bw_plot +
+#                        labs (title = element_blank()), 
+#                    nrow=2,
+#                    labels = "auto") %>%
+#      print.plot (p.name = "basic_global_combined_bw")
+
+
+ggpubr::ggarrange (diff_basic_global_bw_plot + 
+                       labs (title = element_blank()),
+                   p_sim_basic_global_bw_plot +
+                       labs (title = element_blank()), 
+                   nrow=2,
+                                      labels = "auto",
+                   common.legend = TRUE,
+                   legend = "bottom") %>%
+    ggpubr::annotate_figure (top = ggpubr::text_grob (str_wrap ("Fig. 4 (backward order) Amended code", 25), 
+                face = "bold", size = 18)) %>% 
+     print.plot (p.name = "basic_global_combined_bw")
+
+```
+
+
+As shown in Figure \ref{fig:basic_global_diff_bw} and  \ref{fig:basic_global_p_sim_bw}, the network performance with reversed items essentially mirrors that with forward items, with similar performance for both forward and backward items, with the main difference that the performance asymmetry between *C:DE* and *BC:D* part-units was reversed.
+
+## Experiments with Phantom-Units
+The experiments presented so far confound TPs and frequency of occurrence: Units do not only have stronger TPs than part-units, but they also occur more frequently.
+
+This problem was initially noted by [@Aslin1998]. They addressed it by having infants "choose" between units and part-units that were matched in frequency (see [@Aslin1998] for more details on the design). 
+
+[@Endress-Phantoms] and [@Endress-Phantoms-Vision] presented a more extreme control experiment. In their experiments, high-TP units were matched in terms of TPs to high-TP *phantom-units* that had the same TPs as units but never occurred in the familiarization stream and thus had a frequency of occurrence of zero (see [@Endress-Phantoms;@Endress-Phantoms-Vision] for more details on the design). Participants preferred high-TP units to low-TP part-units that had occurred in the familiarization stream, they preferred high-TP phantom-units to low-TP part-units despite the difference in frequency of occurrence, and they did not discriminate between units and phantom-units (but see [@Perruchet2012] for evidence that units and phantom-units might sometimes be discriminated).
+
+Here, we expose the network to a six unit stream inspired by [@Endress-Phantoms] and [@Endress-Phantoms-Vision]. Following this, we test the network on units, phantom-units and part-units.
+
+```{r phantom-experiment-run, echo = FALSE}
+fam_phantoms <- matrix (rep(c(1, 2, 7,
+                              8, 2, 3,
+                              1, 9, 3,
+                              4, 5, 7,
+                              8, 5, 6,
+                              4, 9, 6),
+                            N_REP_PER_WORD),
+                        byrow = TRUE, ncol=3)
+
+test_items_phantoms <- list (1:3,
+                             c(1, 2, 7),
+                             c(2, 7, 8),
+                             c(7, 8, 2))
+
+# We test-items in two ways: by recording the activation in the test-items themselves
+# and by recording the activation in the entire network (_global)
+
+test_act_sum_phantoms_list <- list ()
+test_act_sum_phantoms_global_list <- list ()
+for (current_l in L_ACT){
+    # Sample through forgetting values 
+    
+    current_test_act_sum_phantoms <- data.frame()
+    current_test_act_sum_phantoms_global <- data.frame()
+    
+    for (i in 1:N_SIM){
+        
+        res <- familiarize (stream = fam_phantoms,
+                            l_act = current_l, a = A, b = B, noise_sd_act = NOISE_SD_ACT,
+                            r = R, l_w = L_W, noise_sd_w = NOISE_SD_W,
+                            n_neurons = N_NEURONS)
+        
+        #plot (res$act_sum, type="l")
+        
+        # Record activation in test-items
+        current_test_act_sum_phantoms <- rbind (current_test_act_sum_phantoms,
+                                                test_list (test_item_list = test_items_phantoms,
+                                                           w = res$w,
+                                                           l_act = current_l, a = A, b = B, 
+                                                           noise_sd_act = 0,
+                                                           n_neurons = N_NEURONS,
+                                                           return.global.act = FALSE)) 
+        
+        # Record global activation in network
+        current_test_act_sum_phantoms_global <- rbind (current_test_act_sum_phantoms_global,
+                                                test_list (test_item_list = test_items_phantoms,
+                                                           w = res$w,
+                                                           l_act = current_l, a = A, b = B, 
+                                                           noise_sd_act = 0,
+                                                           n_neurons = N_NEURONS,
+                                                           return.global.act = TRUE)) 
+
+    }
+    # End of forgetting sampling loop
+    
+    test_act_sum_phantoms_list[[1 + length (test_act_sum_phantoms_list)]]  <- 
+        current_test_act_sum_phantoms
+    
+    test_act_sum_phantoms_global_list[[1 + length (test_act_sum_phantoms_global_list)]]  <- 
+        current_test_act_sum_phantoms_global
+}
+
+# Combine results from different forgetting rates
+test_act_sum_phantoms <- 
+    do.call (rbind, 
+             test_act_sum_phantoms_list)
+
+test_act_sum_phantoms <- test_act_sum_phantoms %>% 
+    add_column(l_act = rep (L_ACT,
+                            sapply (test_act_sum_phantoms_list,
+                                    nrow)),
+               .before = 1
+    )
+
+test_act_sum_phantoms_global <- 
+    do.call (rbind, 
+             test_act_sum_phantoms_global_list)
+
+test_act_sum_phantoms_global <- test_act_sum_phantoms_global %>% 
+    add_column(l_act = rep (L_ACT,
+                            sapply (test_act_sum_phantoms_global_list,
+                                    nrow)),
+               .before = 1
+    )
+
+```
+
+```{r phantoms-experiment-global-create_diff}
+
+diff_phantoms_global <- cbind(
+    l_act = data.frame (l_act = test_act_sum_phantoms_global$l_act),
+    
+    # Words vs. Part-Words 
+    w_pw1 = make_diff_score(test_act_sum_phantoms_global,
+                            "1-2-7", "2-7-8",
+                            TRUE),
+    w_pw2 = make_diff_score(test_act_sum_phantoms_global,
+                            "1-2-7", "7-8-2",
+                            TRUE),
+    
+    # Phantom-Words vs. Part-Words 
+    phw_pw1 = make_diff_score(test_act_sum_phantoms_global,
+                              "1-2-3", "2-7-8",
+                              TRUE),
+    phw_pw2 = make_diff_score(test_act_sum_phantoms_global,
+                              "1-2-3", "7-8-2",
+                              TRUE),
+    
+    # Words vs. Phantom-Words
+    w_phw = make_diff_score(test_act_sum_phantoms_global,
+                            "1-2-7", "1-2-3",
+                            TRUE)
+) %>%
+    as.data.frame()
+
+```
+
+```{r phantom-experiment-global-create-plot_diff}
+selected_cols_phantoms <- c("w_pw1", "w_pw2",
+                            "phw_pw1", "phw_pw2",
+                            "w_phw")
+selected_cols_labels_phantoms <- c(
+    w_pw1 = "Unit vs\nBC:D",
+    w_pw2 = "Unit vs\nC:DE",
+    
+    phw_pw1 = "Phantom vs\nBC:D",
+    phw_pw2 = "Phantom vs\nC:DE",
+    
+    w_phw = "Unit vs\nPhantom"
+)
+
+diff_phantoms_global_plot <- 
+    diff_phantoms_global[,c("l_act",
+                     selected_cols_phantoms)] %>%
+    melt (id.vars = "l_act",
+          variable.name= "ItemType",
+          value.name = "d") %>%
+    ggplot(aes(x=ItemType, y=d, fill = ItemType))+
+    format_theme + 
+    remove_x_axis + 
+    labs (title = "Phantom-Units",
+          y = TeX("\\frac{Type_1 - Type_2}{Type_1 + Type_2}")) +
+    # scale_x_discrete(name = "Item Type",
+    #                  breaks = 1:5, 
+    #                  labels=selected_cols_labels_phantoms[selected_cols_phantoms]) + 
+    facet_wrap(~l_act, scales = "free_y") + 
+    scale_fill_discrete(name = element_blank(), 
+                        labels = unname (selected_cols_labels_phantoms[selected_cols_phantoms])) + 
+    theme(#legend.position = "bottom",
+# Current margins
+#diff_phantoms_global_plot$theme$plot.margin
+        plot.margin = unit (c(5.5,5.5,40,5.5), "pt"),
+        legend.position = c(.4, -0.05),
+          legend.direction = "horizontal") + 
+    geom_boxplot()
+
+diff_phantoms_global_plot <- add_signif_to_plot(
+    diff_phantoms_global_plot,
+    diff_phantoms_global,
+    selected_cols_phantoms)
+
+```
+
+```{r phantom-experiment-global-evaluate_diff}
+
+diff_phantoms_global_p_values <- 
+    lapply (L_ACT,
+            function (CURRENT_L){
+                diff_phantoms_global %>%
+                    filter (l_act == CURRENT_L) %>% 
+                    summarize_condition(., 
+                                        selected_cols_phantoms,
+                                        selected_cols_labels_phantoms) %>% 
+                    add_column(l_act = CURRENT_L, .before = 1)
+            }
+    ) 
+
+diff_phantoms_global_p_values <- do.call ("rbind", 
+                                      diff_phantoms_global_p_values )
+
+
+```
+
+```{r phantom-experiment-global-create-plot_p_sim}
+
+p_sim_phantoms_global_plot <- diff_phantoms_global_p_values %>%
+    filter (Statistic == "p.simulations") %>%
+    dplyr::select(-c("Statistic")) %>%
+        melt (id.vars = "l_act",
+          variable.name= "ItemType",
+          value.name = "P")  %>%
+    ggplot(aes(x=ItemType, y= 100 * P, fill = ItemType))+
+    format_theme + 
+    remove_x_axis + 
+    labs (title = "Phantom-Units",
+          y = "Percentage of Simulations") +
+#    scale_x_discrete(name = "Item Type",
+#                     breaks = 1:4, 
+                     #labels=selected_cols_labels_phantoms[selected_cols_phantoms) + 
+    facet_wrap(~l_act, scales = "fixed") + 
+    scale_fill_discrete(name = element_blank(), 
+                        labels = unname (selected_cols_labels_phantoms[selected_cols_phantoms])) + 
+    theme(#legend.position = "bottom",
+        plot.margin = unit (c(5.5,5.5,40,5.5), "pt"),
+        legend.position = c(.4, -0.05),
+        legend.direction = "horizontal") +     geom_bar(stat = "identity") + 
+    geom_abline(intercept = 
+                    get.min.number.of.correct.trials.by.binom.test(N_SIM)/N_SIM * 100, 
+                slope = 0,
+                linetype = "dashed") + 
+    geom_text (aes (label=100*P, y=5))
+
+
+```
+
+
+```{r phantom-experiment-global-create-plot_diff-plot, echo = FALSE, fig.align = 'default', fig.cap = write.caption.diff.scores ("phantoms", "phantoms_global_diff", "forward", "global activation")}
+
+diff_phantoms_global_plot %>%   
+    print.plot
+# cowplot::plot_grid(diff_basic_fw_plot, 
+#                    diff_basic_bw_plot, 
+#                    nrow=2,
+#                    labels = "auto")
+
+```
+
+```{r phantom-experiment-global-create-plot_p_sim-plot, echo = FALSE, fig.align = 'default', fig.cap = write.caption.p.sim("phantoms", "phantoms_global_p_sim", "forward", "global activation")}
+
+p_sim_phantoms_global_plot %>% 
+    print.plot
+
+```
+
+
+```{r phantom-experiment-global-create-plot_combined-plot_new_code, fig.height = 9, fig.cap = "Results of the simulations comprising phantom-units, for items presented in forward order, different forgetting rates (0, 0.2, 0.4, 0.6, 0.8 and 1), and for the different comparisons (Unit vs. Part-Unit: ABC vs. BC:D and ABC vs. C:DE; Phantom-Unit vs. Part-Unit: Phantom-Unit vs. BC:D and Phantom-Unit vs. C:DE; Unit vs. Phantom-Unit). (a) Difference scores. The scores are calculated based the global activation as a measure of the network’s familiarity with the items. Significance is assessed based on Wilcoxon tests against the chance level of zero. (b) Percentage of simulations with a preference for the target items. The simulations are assessed based on the global activation. The dashed line shows the minimum percentage of simulations that is significant based on a binomial test."}
+
+# cowplot::plot_grid(diff_phantoms_global_plot + 
+#                        labs (
+#                            title = element_blank(),
+#         legend.position = c(.475, -0.125)),
+#                    p_sim_phantoms_global_plot +
+#                        labs (title = element_blank(),
+#                               legend.position = c(.475, -0.125)), 
+#                    nrow=2,
+#                    labels = "auto") %>%
+#      print.plot (p.name = "phantoms_global_combined")
+
+
+ggpubr::ggarrange (diff_phantoms_global_plot + 
+                       labs (
+                           title = element_blank(),
+        legend.position = c(.475, -0.125)),
+                   p_sim_phantoms_global_plot +
+                       labs (title = element_blank(),
+                              legend.position = c(.475, -0.125)), 
+                   nrow=2,
+        labels = "auto",
+                   common.legend = TRUE,
+                   legend = "bottom") %>%
+        ggpubr::annotate_figure (top = ggpubr::text_grob (str_wrap ("Fig. 5 (phantom units) Amended code", 25), 
+                face = "bold", size = 18)) %>% 
+     print.plot (p.name = "phantoms_global_combined")
+```
+
+```{r phantom-experiment-global-evaluate_diff-print, results='hide'}
+
+diff_phantoms_global_p_values %>%
+    rename_stuff_in_tables %>%
+    mutate(Statistic = italisize_for_tex (Statistic)) %>%  
+    docxtools::format_engr(sigdig=3) %>%
+    knitr::kable(
+        "latex", 
+        longtable = FALSE,
+        booktabs = TRUE, 
+        escape = FALSE,
+        caption = '\\label{tab:phantoms_global_diff} Detailed results for the different forgetting rates and comparisons, using the global activation as a measure of the network\'s familiarity with the items. $p_{Wilcoxon}$ represents the *p* value of a Wilcoxon test on the difference scores against the chance level of zero. $P_{Simulations}$ represents the proportion of simulations showing positive difference scores.') %>%
+    kableExtra::kable_styling(latex_options = c(#"striped", 
+                                            "scale_down",
+                                            "repeat_header")) 
+```
+
+```{r phantoms-experiment-global-sign-pattern-print, results='hide'}
+get_sign_pattern_from_results(L_ACT, 
+                              diff_phantoms_global_p_values) %>%
+    setNames(., gsub("l_act", "$\\\\lambda_a$", names(.))) %>%
+    knitr::kable(
+        "latex",         
+        longtable = FALSE,
+        booktabs = TRUE, 
+        escape = FALSE,
+        caption = '\\label{tab:phantoms_global_sign_pattern} Pattern of significance for the different forgetting rates and comparisons, and using the global activation a measure of the network\'s familiarity with the items. +, - and 0 represent, respectively, a significant preference for the target item, a significant preference against the target item, or no significant preference, as evaluated by Wilcoxon tests on the relevant difference scores. Numbers indicate the proportion of simulations preferring target-items; bold-face numbers indicate significance in a binomial test.') %>%
+    kableExtra::kable_styling(latex_options = c("striped", 
+#                                                "scale_down",
+                                                "repeat_header")) 
+
+```
+
+The results are shown in Figures \ref{fig:phantoms_global_diff} and \ref{fig:phantoms_global_p_sim}. As in the experiments reported above, the network failed on all comparisons for low forgetting rates as it indiscriminately learned associations among all items. 
+
+For medium and, in this experiment, high forgetting rates, the network preferred units and phantom-units over part-units roughly to the same extent. As in [@Endress-Phantoms] and [@Endress-Phantoms-Vision], it thus more sensitive to differences in TPs than to differences in frequency of occurrence; we also replicate the somewhat better performance when the part-unit is of *C:DA* type compared to part-units of *BC:D* type.  
+
+In contrast, the network does not seem to discriminate between units and phantom-units, replicating [@Endress-Phantoms] and [@Endress-Phantoms-Vision] results. 
+
+# Discussion
+Identifying recurrent units in a continuous signal is an important problem, especially for language acquisition. Organisms might potentially solve this problem by tracking co-occurrence statistics among items, assessing the predictiveness of different items. Indeed, organisms have sophisticated statistical learning abilities, allowing them to encode and recognize Transitional Probabilities (TPs) irrespective of whether items are played forward or backwards, whether the items are temporarily adjacent or non-adjacent, and whether the units in which the TPs occur are known or entirely novel.
+
+We show that a simple neural network accounts for all of these phenomena based on correlational (i.e., Hebbian) learning. Interestingly, the critical ingredient for successful learning seems to be forgetting: If forgetting is too weak, indiscriminate associations are formed that are, therefore, uninformative; conversely, if forgetting is too strong, no associations are formed.
+
+Our results also lead to a counterintuitive conclusion about the computational function of statistical learning. While our model presents a rather simple and straightforward mechanistic explanation for our sophisticated statistical learning abilities, these TP-based mechanisms are only partially compatible with the presumed function of statistical learning -- namely to store recurrent units in memory. Ultimately, a mechanism that recognizes items played backwards or items it has not encountered at all can hardly be said to maintain faithful memory representations of the relevant items. Conversely, recognizing backwards or unheard items is inconsistent with models that actually store items in memory [@Batchelder2002;@Perruchet1998].
+
+Similar dissociations between statistical learning abilities and memory for specific episodes between amnesic and Parkinson's patients have led to the conclusion that humans have a (cortical) declarative memory system that is independent of a (neostriatal) system for forming associations [@Knowlton1996a;@Poldrack2001]. Statistical learning might be used for predictive processing rather than memory per se [@Goujon2015;@Turk-Browne2010], and our model is consistent with such a function.[^parkinson] 
+
+[^parkinson]: While Parkinson's patients were initial thought to be impaired in associative learning in general [@Knowlton1996a], further research revealed that, for many tasks, such patients have intact associative learning abilities, and that their impairment might depend on the need to integrate probabilistic feedback across learning episodes [@Smith2006]. Be that as it might, statistical learning does not seem to lead to declarative knowledge of specific even in studies that link it to the Medial Temporal Lobe [@Turk-Browne2010].
+
+Together with our model, such results suggest that statistical learning, powerful as it is,  might not be sufficient for placing recurring units in memory. After all, we clearly have declarative memories of such items, and know that we know the word *learning* rather than a backwards items such as *gninrael*. As a result, a critical question for future research is to find out how the power of predictive processes such as statistical learning is harnessed to form declarative memories of recurring units in sequences.
+
+# Supplementary Information
+
+## Supplementary Information 1: Model definition
+The activation of the $i^{th}$ unit is given by
+
+$$
+\dot{x_i} = -\lambda_a x_i + \alpha \sum_{j \neq i} w_{ij} F(x_j) - \beta \sum_{j \neq i} F(x_j) + \text{noise}
+$$
+
+where $F(x)$ is some activation function. (Here we use $F(x) = \frac{x}{1 + x}$. The first term represents exponential forgetting with a time constant of $\lambda_a$, the second term activation from other units, and the third term inhibition among items to keep the overall activation in a reasonable range.
+
+The weights $w_{ij}$ are updated using a Hebbian learning rule
+
+$$
+\dot{w}_{ij} = - \lambda_w w_{ij} + \rho F(x_i) F(x_j) 
+$$
+
+$\lambda_w$ is the time constant of forgetting (which we set to zero in our simulations) while $\rho$ is the learning rate.
+
+A discrete version of the activation equation is given by 
+
+$$
+x_i (t+1) = x_i (t) - \lambda_a x_i(t) + \alpha \sum_{j \neq i} w_{ij} F(x_j) - \beta \sum_{j \neq i} F(x_j) + \text{noise}
+$$
+
+While the time step is arbitrary in the absence of external input (see [@Endress-Catastrophic-Interference] for a proof), we use the duration of individual units (e.g., syllables, visual symbols etc.) as the time unit in our discretization as associative learning is generally invariant under temporal scaling of the experiment [@Gallistel2000PsychRev;@Gallistel2001b]. Further, while only excitatory connections are tuned by learning in our model, the same effect could be obtained by tuning inhibition, for example through tunable disinhibitory interneurons [@Letzkus2011]. Here, we simply focus on the result that a fairly generic network architecture accounts for the hallmarks of statistical learning that, so far, have eluded explanation. 
+
+The discrete updating rule for the weights is 
+
+$$
+w_{ij} (t+1) = w_{ij} (t) - \lambda_w w_{ij} (t) + \rho F(x_i) F(x_j) 
+$$
+
+Simulation parameters are listed in Table \ref{tab:params}. An *R* implementation is available at XXX.
+
+```{r list-parameters2, ref.label='list-parameters', echo=FALSE, results='markup', caption='\\label{tab:params}: Simulation parameters.'}
+```
+
+## Supplementary Information 2: Detailed results 
+Table \ref{tab:basic_global_diff} provides detailed results for the simulations in terms of descriptive statistics and statistical tests for the simulation testing the recognition of (forward and backward) units, part-units, rule-units and class-units.
+
+Table \ref{tab:phantoms_global_diff} provides similar results for the simulations testing the recognition of units, part-units and phantom-units.
+
+```{r basic-experiment-global-evaluate_diff-print2, ref.label='basic-experiment-global-evaluate_diff-print', echo=FALSE, results='markup'}
+
+```
+
+```{r phantom-experiment-global-evaluate_diff-print2, ref.label='phantom-experiment-global-evaluate_diff-print', echo=FALSE, results='markup'}
+
+```
+
